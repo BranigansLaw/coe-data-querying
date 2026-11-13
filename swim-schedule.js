@@ -153,47 +153,135 @@ function cityNotices(notices, code) {
   return notices.filter((notice) => pattern.test(notice.facility_service_name || '') && notice.status);
 }
 
-function printResults(title, results, notices) {
-  console.log(`\n${title}`);
-  if (!results.length) console.log('  No matching overlaps found in the available data.');
-  for (const { pool, start, end, labels } of results) {
-    const city = CITY[pool.facility];
-    const county = COUNTY[pool.facility];
-    const name = city ? city[0] : pool.facility;
-    const url = city ? `https://www.edmonton.ca/activities_parks_recreation/${city[1]}` : county[1];
-    console.log(`\n${printTime(start)} - ${printTime(end)} | ${name}`);
-    console.log(`  Pool: ${pool.label} [${pool.certainty}]`);
-    for (const label of labels) {
-      const count = laneCount(label);
-      console.log(`  Lane swim: ${label} | ${count === null ? 'lane count unknown' : `${count} lanes`}`);
+function wrapCell(value, width) {
+  const lines = [];
+  let line = '';
+  for (let word of value.split(/\s+/)) {
+    if (line && line.length + word.length + 1 > width) {
+      lines.push(line);
+      line = '';
     }
-    console.log(`  Contact: ${city ? 'Edmonton 311 (outside Edmonton: 780-442-5311)' : county[0]} | ${url}`);
-    if (city && notices && cityNotices(notices, pool.facility).length) console.log('  WARNING: Facility notices below may affect this schedule.');
+    while (word.length > width && !line) {
+      lines.push(word.slice(0, width));
+      word = word.slice(width);
+    }
+    line += `${line ? ' ' : ''}${word}`;
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [''];
+}
+
+function poolSummary(pool) {
+  if (pool.certainty.includes('verify')) return 'Leisure*';
+  if (pool.certainty.includes('ages 0-5')) return 'Kids (0-5)';
+  const activity = pool.label.replace(/ \(Tot Pool\)$/, '');
+  if (activity === 'Tot Pool') return 'Tot';
+  if (activity === 'Play Date at the Pool') return 'Tot: play date';
+  if (activity === 'Adapted Swim') return 'Tot: adapted';
+  if (activity === 'Public Swim') return 'Tot: public';
+  return `Tot: ${activity}`;
+}
+
+function laneSummary(label) {
+  const city = label.match(/^Lane (?:Swim )?(?:\((\d+) (?:Metres|Meters)\)|(\d+) m)(?: (\d+) Lanes?)?$/i);
+  if (city) return `${city[3] || '?'} lanes (${city[1] || city[2]}m)`;
+  const county = label.match(/^Lap Swim (?:- (Shallow|Deep)(?: \((\d+) lanes?\))?|\((Shallow|Deep)\))$/i);
+  if (county) return `${county[2] || '?'} ${(county[1] || county[3]).toLowerCase()}`;
+  return laneCount(label) === null ? `${label} (count unknown)` : label;
+}
+
+function includesRequestedTime(entry, requestedTime) {
+  let candidate = Math.floor(entry.start / DAY) * DAY + requestedTime;
+  if (candidate < entry.start) candidate += DAY;
+  return candidate < entry.end;
+}
+
+function printResults(results, notices, requestedTime) {
+  const sorted = [...results].sort((left, right) =>
+    (requestedTime === undefined ? 0 : Number(includesRequestedTime(right, requestedTime)) - Number(includesRequestedTime(left, requestedTime))) ||
+    left.start - right.start || left.pool.facility.localeCompare(right.pool.facility));
+  if (!sorted.length) {
+    console.log('\nNo matching overlaps found in the available data.');
+    return;
+  }
+  if (requestedTime !== undefined) {
+    const time = `${String(Math.floor(requestedTime / 60)).padStart(2, '0')}:${String(requestedTime % 60).padStart(2, '0')}`;
+    console.log(`\nTimeframes containing ${time} are listed first; other times follow.`);
+  }
+  const widths = [10, 11, 16, 13, 14, 1];
+  const rows = [['Date', 'Time', 'Facility', 'Pool', 'Lane swims', '!']];
+  for (const { pool, start, end, labels } of sorted) {
+    const city = CITY[pool.facility];
+    const endTime = printTime(end).slice(11) + (dateString(end) !== dateString(start) ? ' +1 day' : '');
+    rows.push([
+      dateString(start), `${printTime(start).slice(11)}-${endTime}`, city ? city[2] : pool.facility.replace(' Leisure Centre', ''),
+      poolSummary(pool), labels.map(laneSummary).join(' / '),
+      city && notices && cityNotices(notices, pool.facility).length ? '!' : '',
+    ]);
+  }
+  console.log('');
+  for (const [index, row] of rows.entries()) {
+    const cells = row.map((value, cell) => wrapCell(value, widths[cell]));
+    for (let line = 0; line < Math.max(...cells.map((cell) => cell.length)); line++) {
+      console.log(cells.map((cell, column) => (cell[line] || '').padEnd(widths[column])).join(' | ').trimEnd());
+    }
+    if (index === 0) console.log(widths.map((width) => '-'.repeat(width)).join('-+-'));
+  }
+  console.log('\n? = lane count not listed; * = verify leisure pool is suitable for children.');
+  console.log('\nFacility contacts:');
+  for (const facility of [...new Set(sorted.map(({ pool }) => pool.facility))]) {
+    const city = CITY[facility];
+    const county = COUNTY[facility];
+    console.log(`  ${city ? city[0] : facility}: ${city ? '311 (outside Edmonton: 780-442-5311)' : county[0]} | ${city ? `https://www.edmonton.ca/activities_parks_recreation/${city[1]}` : county[1]}`);
   }
   if (notices) {
-    const facilities = [...new Set(results.map(({ pool }) => pool.facility))];
-    for (const code of facilities) {
-      const entries = cityNotices(notices, code);
-      if (!entries.length) continue;
-      console.log(`\nNotices for ${CITY[code][0]} (dates may not overlap the listed swim):`);
-      for (const notice of entries) console.log(`  ${notice.status} | ${notice.service || 'facility'} | ${notice.notice_date_information || 'dates unspecified'} | ${(notice.additional_information || '').replace(/\s+/g, ' ').trim()}`);
-    }
+    const facilities = [...new Set(sorted.map(({ pool }) => pool.facility))].filter((facility) => CITY[facility]);
+    const entries = facilities.flatMap((facility) => cityNotices(notices, facility).map((notice) => ({ facility, notice })));
+    if (entries.length) console.log('\n! Facility notices (dates may not overlap the listed swim):');
+    for (const { facility, notice } of entries) console.log(`  ${CITY[facility][0]}: ${notice.status} | ${notice.service || 'facility'} | ${notice.notice_date_information || 'dates unspecified'}`);
   }
+}
+
+function parseScheduleArgs(args, now) {
+  const today = Math.floor(now / DAY) * DAY;
+  let range = { from: today, until: today + 7 * DAY };
+  let hasRange = false;
+  let requestedTime;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index];
+    const value = args[index + 1];
+    if (option === '--days' && !hasRange && /^\d+$/.test(value || '')) {
+      const days = Number(value);
+      if (!Number.isSafeInteger(days) || days < 1 || days > 365) return null;
+      range = { from: today, until: today + days * DAY };
+      hasRange = true;
+    } else if (option === '--date' && !hasRange && /^\d{4}-\d{2}-\d{2}$/.test(value || '')) {
+      const from = dayNumber(value);
+      if (!Number.isFinite(from) || dateString(from) !== value) return null;
+      range = { from, until: from + DAY };
+      hasRange = true;
+    } else if (option === '--time' && requestedTime === undefined && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value || '')) {
+      const [hour, minute] = value.split(':').map(Number);
+      requestedTime = hour * 60 + minute;
+    } else return null;
+  }
+  return requestedTime === undefined ? range : { ...range, requestedTime };
 }
 
 async function main(args) {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: node swim-schedule.js [--days N]\nShows overlapping kids/leisure pool and lane swim schedules, starting today (default: 7 days).');
+    console.log('Usage: node swim-schedule.js [--days N | --date YYYY-MM-DD] [--time HH:MM]\nShows overlapping kids/leisure pool and lane swim schedules, starting today (default: 7 days).');
     return 0;
   }
-  const days = args.length === 0 ? 7 : args.length === 2 && args[0] === '--days' && /^\d+$/.test(args[1]) ? Number(args[1]) : NaN;
-  if (!Number.isSafeInteger(days) || days < 1 || days > 365) {
-    console.error('Usage: node swim-schedule.js [--days N] (N must be between 1 and 365)');
+  const now = localNow();
+  const range = parseScheduleArgs(args, now);
+  if (!range) {
+    console.error('Usage: node swim-schedule.js [--days N | --date YYYY-MM-DD] [--time HH:MM] (N must be between 1 and 365; time uses 24-hour format)');
     return 2;
   }
-  const now = localNow();
-  const from = Math.floor(now / DAY) * DAY;
-  const until = from + days * DAY;
+  const { from, until, requestedTime } = range;
+  const today = Math.floor(now / DAY) * DAY;
+  const showEntry = (entry) => from !== today || entry.end > now;
   console.log(`Swimming overlaps, ${dateString(from)} through ${dateString(until - 1)} (America/Edmonton)`);
   console.log('Call ahead: schedules and lane counts are planned, not real-time availability. Restrictions and closures may apply.');
   const keys = Object.keys(SOURCES);
@@ -203,31 +291,35 @@ async function main(args) {
     return [keys[index], response.status === 'fulfilled' ? response.value : null];
   }));
   let failed = responses.some((response) => response.status === 'rejected');
+  const results = [];
   if (data.pools && data.lanes) {
     const { pools, lanes } = cityEvents(data.pools, data.lanes);
     const latestDates = [data.pools, data.lanes].map((rows) => rows.reduce((latest, row) => row.bookingdate ? Math.max(latest, dayNumber(row.bookingdate.slice(0, 10))) : latest, -Infinity));
+    const earliestDates = [data.pools, data.lanes].map((rows) => rows.reduce((earliest, row) => row.bookingdate ? Math.min(earliest, dayNumber(row.bookingdate.slice(0, 10))) : earliest, Infinity));
     const cityLast = Math.min(...latestDates);
+    const cityFirst = Math.max(...earliestDates);
     console.log(`\nEdmonton feed coverage ends ${Number.isFinite(cityLast) ? dateString(cityLast) : 'unknown'}; future dates beyond this are not included.`);
-    if (days > 7 || until > cityLast + DAY) console.log('WARNING: Edmonton open data has a rolling seven-day horizon; requested dates may be missing.');
+    if (until - from > 7 * DAY || from < cityFirst || until > cityLast + DAY) console.log('WARNING: Edmonton open data has a rolling seven-day horizon; requested dates may be missing.');
     if ([data.pools, data.lanes, data.notices].some((rows) => rows && rows.length >= 50000)) console.log('WARNING: An Edmonton feed reached its row limit and may be incomplete.');
     if (!data.notices) console.log('WARNING: Closure notices could not be checked.');
-    printResults('Edmonton', overlaps(pools, lanes, from, until).filter((entry) => entry.end > now), data.notices);
+    results.push(...overlaps(pools, lanes, from, until).filter(showEntry));
   } else console.log(`\nEdmonton schedules unavailable. Facility directory: ${CITY_DIRECTORY}`);
   if (data.county) {
     try {
       const { pools, lanes, coverageEnd } = countyEvents(data.county);
       console.log(`\nStrathcona calendar's latest event ends ${coverageEnd === null ? 'unknown' : printTime(coverageEnd)}; this is not a completeness guarantee.`);
       if (coverageEnd === null || until > coverageEnd) console.log('WARNING: Requested dates extend beyond the county calendar export.');
-      printResults('Strathcona County', overlaps(pools, lanes, from, until).filter((entry) => entry.end > now));
+      results.push(...overlaps(pools, lanes, from, until).filter(showEntry));
     } catch (error) {
       failed = true;
       console.error(`WARNING: Could not parse Strathcona calendar: ${error.message}`);
     }
   }
+  printResults(results, data.notices, requestedTime);
   console.log(`\nCheck city notifications: https://coewebapps.edmonton.ca/facilitynotifications/\nCounty schedule: ${COUNTY_SCHEDULE}`);
   return failed ? 1 : 0;
 }
 
 if (require.main === module) main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(error.message); process.exitCode = 1; });
 
-module.exports = { activeWindows, laneCount, cityEvents, countyEvents, dayNumber, overlaps, cityNotices, main };
+module.exports = { activeWindows, laneCount, cityEvents, countyEvents, dayNumber, overlaps, cityNotices, printResults, parseScheduleArgs, main };
